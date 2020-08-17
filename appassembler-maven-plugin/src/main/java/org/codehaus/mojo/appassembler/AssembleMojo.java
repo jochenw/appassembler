@@ -25,6 +25,10 @@ package org.codehaus.mojo.appassembler;
  */
 
 import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStream;
+import java.lang.reflect.UndeclaredThrowableException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -32,6 +36,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
 import java.util.StringTokenizer;
 
@@ -39,10 +44,13 @@ import org.apache.maven.artifact.Artifact;
 import org.apache.maven.artifact.repository.layout.ArtifactRepositoryLayout;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugin.MojoFailureException;
+import org.apache.maven.plugins.annotations.Component;
 import org.apache.maven.plugins.annotations.LifecyclePhase;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.plugins.annotations.ResolutionScope;
+import org.apache.maven.project.MavenProject;
+import org.apache.maven.shared.utils.io.FileUtils;
 import org.codehaus.mojo.appassembler.daemon.DaemonGenerationRequest;
 import org.codehaus.mojo.appassembler.daemon.DaemonGeneratorException;
 import org.codehaus.mojo.appassembler.daemon.script.Platform;
@@ -139,6 +147,12 @@ public class AssembleMojo
     private boolean showConsoleWindow;
 
     /**
+     * Whether to make the created application autoupdating itself.
+     */
+    @Parameter(property="autoUpdating", defaultValue="false", required=false)
+    private boolean autoUpdating;
+
+    /**
      * The following can be used to use all project dependencies instead of the default behavior which represents
      * <code>runtime</code> dependencies only.
      *
@@ -147,6 +161,11 @@ public class AssembleMojo
     @Parameter( defaultValue = "false" )
     private boolean useAllProjectDependencies;
 
+    /**
+     * The Maven Project
+     */
+    @Component
+    private MavenProject project;
 
     // -----------------------------------------------------------------------
     // Components
@@ -207,6 +226,65 @@ public class AssembleMojo
     // Execute
     // ----------------------------------------------------------------------
 
+    protected void generateAutoupdateProperties( DaemonGenerationRequest request, org.codehaus.mojo.appassembler.model.Daemon daemon )
+    	throws IOException
+    {
+    	final Properties properties = new Properties( );
+    	properties.put( "version.number", project.getVersion() );
+    	properties.put( "application.main.class", daemon.getMainClass() );
+    	int i = 0;
+    	for(Dependency dep : daemon.getClasspath().getDependencies())
+    	{
+    		properties.put( "application.classpath.element." + (i++), dep.getRelativePath());
+    	}
+    	final File binDir = new File( request.getOutputDirectory(), request.getBinFolder() );
+    	final File propertyFile = new File( binDir, request.getDaemon().getId() + ".properties" );
+    	FileUtils.forceMkdir( binDir );
+    	OutputStream out = null;
+    	Throwable th = null;
+    	try {
+    		out = new FileOutputStream( propertyFile );
+    		properties.store( out, null );
+    		out.close();
+    		out = null;
+    	} catch (Throwable t)
+    	{
+    		th = t;
+    	}
+    	finally
+    	{
+    		if ( out != null )
+    		{
+    			try
+    			{
+    				out.close();
+    			} catch (Throwable t)
+    			{
+    				if ( th != null )
+    				{
+    					th = t;
+    				}
+    			}
+    		}
+    	}
+    	if (th != null)
+    	{
+    		if (th instanceof RuntimeException)
+    		{
+    			throw (RuntimeException) th;
+    		} else if (th instanceof Error)
+    		{
+    			throw (Error) th;
+    		} else if (th instanceof IOException)
+    		{
+    			throw (IOException) th;
+    		} else
+    		{
+    			throw new UndeclaredThrowableException(th);
+    		}
+    	}
+    }
+    
     public void checkDeprecatedParameterAndFailIfOneOfThemIsUsed()
         throws MojoExecutionException
     {
@@ -280,6 +358,7 @@ public class AssembleMojo
             }
 
             Set<String> validatedPlatforms = validatePlatforms( program.getPlatforms(), defaultPlatforms );
+            boolean autoUpdatePropertiesGenerated = false;
 
             for ( String platform : validatedPlatforms )
             {
@@ -296,6 +375,17 @@ public class AssembleMojo
                 try
                 {
                     daemonGeneratorService.generateDaemon( request );
+                    if (autoUpdating  &&  !autoUpdatePropertiesGenerated) {
+                    	try
+                    	{
+                    		generateAutoupdateProperties( request, daemon );
+                    	} catch ( IOException e )
+                    	{
+                    		throw new MojoExecutionException( "Error while generating property file for the program '"
+                    				+ program.getId() + "' for the platform '" + platform + "': " + e.getMessage(), e );
+                    	}
+                    	autoUpdatePropertiesGenerated = true;
+                    }
                 }
                 catch ( DaemonGeneratorException e )
                 {
